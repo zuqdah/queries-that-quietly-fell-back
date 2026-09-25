@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -MinimumVersion 1.22.0 -Force
+
+      # Two things have to be true before a clean scan means anything: the
+      # analyzer has to load, and it has to actually run. A crashed analyzer
+      # reports zero findings, which reads exactly like clean code -- and
+      # PSScriptAnalyzer really does throw "Object reference not set to an
+      # instance of an object" on its first path-based invocation and work on
+      # every call after. That was measured twice, on two labs, on two machines.
+      # So a snippet with two known violations is scanned first: it proves the
+      # analyzer still catches what it should, and being the first call it
+      # absorbs the warm-up.
+      #
+      # Both rules are platform-independent on purpose. The obvious canary is an
+      # aliased `ls`, and PSAvoidUsingCmdletAliases does not fire for it on Linux
+      # where ls is a real binary -- a check that would pass on a developer's
+      # Windows machine and fail only here.
+      - name: Prove the analyzer works, then scan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module PSScriptAnalyzer -ErrorAction Stop
+          if (-not (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {
+            throw 'PSScriptAnalyzer did not load. A scan that cannot run must fail, not pass quietly.'
+          }
+          Write-Output "PSScriptAnalyzer $((Get-Module PSScriptAnalyzer).Version) on PowerShell $($PSVersionTable.PSVersion)"
+
+          $canary = @(
+            'function Do-Canary {'
+            '    $neverUsed = ''deliberate'''
+            '    return 1'
+            '}'
+          ) -join "`n"
+
+          $found = @()
+          foreach ($attempt in 1..3) {
+            try { $found = @(Invoke-ScriptAnalyzer -ScriptDefinition $canary -ErrorAction Stop); break }
+            catch { Write-Output "Canary attempt $attempt failed: $($_.Exception.Message)"; if ($attempt -eq 3) { throw } }
+          }
+          foreach ($rule in 'PSUseDeclaredVarsMoreThanAssignments', 'PSUseApprovedVerbs') {
+            if ($rule -notin $found.RuleName) {
+              throw "The analyzer did not report '$rule' against code that violates it. A clean result on real code would prove nothing."
+            }
+          }
+          Write-Output 'Canary caught both rules. The analyzer is working.'
+
+          $results = @()
+          $results += Invoke-ScriptAnalyzer -Path module -Recurse -ErrorAction Stop
+          $results += Invoke-ScriptAnalyzer -Path scripts -Recurse -ErrorAction Stop
+          $results += Invoke-ScriptAnalyzer -Path tests -Recurse -ErrorAction Stop `
+            -ExcludeRule PSReviewUnusedParameter, PSUseShouldProcessForStateChangingFunctions
+          if ($results.Count) {
+            $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message |
+              Out-String -Width 200 | Write-Output
+            throw "PSScriptAnalyzer reported $($results.Count) issue(s)."
+          }
+          Write-Output 'PSScriptAnalyzer is clean.'
+
+      - name: Test
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $config
+
+      # The matrix is the yardstick, and an incoherent one would make the drill
+      # unfalsifiable while its report still looked rigorous. Checked here so it
+      # fails in seconds rather than after provisioning a warehouse.
+      - name: Check the matrix is coherent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ./module/DirectLakeMode/DirectLakeMode.psm1 -Force
+          $matrix = Get-FallbackMatrix -Path fallback-matrix.json
+
+          $guards = @($matrix.guards)
+          $diverging = @($guards | Where-Object { $_.expectAutomatic -ne $_.expectDirectLakeOnly })
+          $graded = ($guards.Count * @($matrix.passes).Count) + @($matrix.assertions).Count
+          Write-Output "$($guards.Count) guards over $(@($matrix.passes).Count) passes, $(@($matrix.assertions).Count) assertions, $graded graded outcomes."
+
+          @(
+            '### Fallback matrix'
+            ''
+            "**$($guards.Count)** guards graded in both passes, plus **$(@($matrix.assertions).Count)** assertions. $graded graded outcomes."
+            ''
+            "Changed by ``directLakeBehavior``: $(($diverging.id) -join ', ')"
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-results
+          path: testResults.xml
+          if-no-files-found: warn
+
+  actions:
+    name: Lint the workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+
+  shell:
+    name: Lint the shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:stable scripts/bootstrap.sh

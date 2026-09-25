@@ -1,0 +1,137 @@
+{
+  "note": "Declared before the drill runs. Every guard is graded in both passes, and the two passes differ only in the semantic model's directLakeBehavior property -- Automatic, which is the default, and DirectLakeOnly.",
+  "source": {
+    "kind": "Warehouse",
+    "why": "A Fabric warehouse takes CREATE TABLE, INSERT and CREATE VIEW over TDS and writes Delta tables underneath, so the whole fixture is T-SQL. A lakehouse would need Spark to land a Delta table, and an unmaterialised SQL view -- one of the two fallback triggers -- is a warehouse object anyway."
+  },
+  "observedFallbackReasons": {
+    "note": "The values TABLETRAITS() actually returns, measured rather than taken from the documentation. Recorded here because the documentation says something different and the difference is load-bearing.",
+    "inDirectLakeMode": null,
+    "documentationClaims": "None",
+    "unframed": "Not Framed",
+    "viewBacked": "View",
+    "why": "The docs state that a value of 'None' means the table is using Direct Lake mode. A framed table reports null. Null is also what an unreadable column looks like, so the drill has to record whether the column was present separately from what was in it, or it cannot tell a healthy table from a failed measurement.",
+    "viewRefreshUnderDirectLakeOnly": "ModelRefresh_ShortMessage_ProcessingError: We cannot access the source Delta table",
+    "viewFramingAlwaysFails": "Framing a view-backed table fails under automatic and directLakeOnly alike, with ModelRefresh_ShortMessage_ProcessingError naming the table. The model-level status only reports Failed when there is nothing else in the model to frame successfully."
+  },
+  "phases": [
+    {
+      "id": "beforeFraming",
+      "why": "The model has been created through the API and never refreshed. This is the state every deployment pipeline leaves a model in until something frames it, and it is measured first because creating the model is what produces it -- no extra setup is needed to stage the defect."
+    },
+    {
+      "id": "afterFraming",
+      "why": "One refresh later. Framing is what a Direct Lake refresh does: it copies metadata, not data, and takes seconds."
+    }
+  ],
+  "passes": [
+    {
+      "id": "automatic",
+      "directLakeBehavior": "automatic",
+      "why": "The default, and what Microsoft's own guidance recommends for production. It is the reason this lab exists: when a Direct Lake condition is not met the query does not fail, it silently switches to DirectQuery and returns the right answer."
+    },
+    {
+      "id": "directLakeOnly",
+      "directLakeBehavior": "directLakeOnly",
+      "why": "The remediation. The same conditions produce an error instead of a quiet downgrade. This pass also proves the fallback in the other one was real rather than a measurement artefact: the same table cannot both refuse and be fine."
+    }
+  ],
+  "guards": [
+    {
+      "id": "framed-table-is-direct-lake",
+      "title": "A framed table over a real Delta table runs in Direct Lake mode",
+      "severity": "Baseline",
+      "model": "clean",
+      "table": "Sales",
+      "phase": "afterFraming",
+      "expectAutomatic": "DirectLake",
+      "expectDirectLakeOnly": "DirectLake",
+      "why": "The case everyone has watched work, and it is here so the other two mean something. Without observing a table that genuinely runs in Direct Lake mode, a drill reporting FellBack for everything -- which is what a broken TABLETRAITS read looks like -- would pass the finding for free."
+    },
+    {
+      "id": "unframed-table-falls-back",
+      "title": "The same table, before the model was ever framed, does not run in Direct Lake mode",
+      "severity": "Critical",
+      "model": "clean",
+      "table": "Sales",
+      "phase": "beforeFraming",
+      "expectAutomatic": "FellBack",
+      "expectDirectLakeOnly": "Refused",
+      "why": "Deliberately the same table in the same model as the baseline, so framing is the only difference between them and the table itself cannot be the reason. It is also the state every deployment pipeline produces: tables created through the API are unprocessed until something sends a refresh, and nothing in the deployment output says so."
+    },
+    {
+      "id": "view-backed-table-falls-back",
+      "title": "A table built on an unmaterialised SQL view never runs in Direct Lake mode, framed or not",
+      "severity": "Critical",
+      "model": "view",
+      "table": "SalesView",
+      "phase": "afterFraming",
+      "expectAutomatic": "FellBack",
+      "expectDirectLakeOnly": "Refused",
+      "why": "The likeliest way a real model acquires this permanently. Somebody points a table at a view because the view already had the right shape; the model is still labelled Direct Lake, the report still works, and every query for that table is federated from then on. Unlike the unframed case, no refresh fixes it."
+    }
+  ],
+  "assertions": [
+    {
+      "id": "fallback-query-returns-correct-results",
+      "severity": "Critical",
+      "expected": true,
+      "why": "The fallen-back table returns the same numbers as the framed one. Correctness is not the signal, which is why nobody notices: a report over this model is right, and stays right while being slower and more expensive than the thing it was designed to be."
+    },
+    {
+      "id": "no-error-or-warning-surfaced",
+      "severity": "Critical",
+      "expected": true,
+      "why": "In the Automatic pass the queries succeed with no error and no warning. A pipeline gating on whether the DAX query worked learns nothing at all."
+    },
+    {
+      "id": "storage-mode-still-reports-direct-lake",
+      "severity": "Critical",
+      "expected": true,
+      "why": "Measured, and it holds: TABLETRAITS reports StorageMode=DirectLake for a table whose every query is being federated, in both the unframed and the view-backed case. Storage mode is a model property and fallback is a runtime decision, so the metadata a reviewer would check cannot distinguish them. This began as an Uncertain assertion and was promoted after the values were observed."
+    },
+    {
+      "id": "refresh-status-hides-a-table-that-never-framed",
+      "severity": "Critical",
+      "expected": true,
+      "why": "The last signal anyone would trust, and it is the worst of them. A model holding one framable table and one view-backed table reports its refresh as Completed, because something in it framed. The view-backed table did not, and still reports a fallback reason afterwards. So a deployment pipeline that checks the refresh succeeded is told yes by a model with a permanently federated table in it."
+    },
+    {
+      "id": "directlakeonly-refuses-to-frame-a-view-backed-model",
+      "severity": "Critical",
+      "expected": true,
+      "why": "Observed on every run so far: with fallback disabled, framing a model whose only table is a view fails with ModelRefresh_ShortMessage_ProcessingError naming the table. This is the half of the refresh behaviour that is stable, and it is the useful half -- it is the only signal in the whole lab that names the problem out loud without being asked."
+    }
+  ],
+  "models": [
+    {
+      "id": "clean",
+      "tables": [
+        "Sales"
+      ],
+      "why": "Sales only. The view-backed table is deliberately NOT here: measured, a directLakeOnly model containing a view-backed table fails to refresh entirely, which would leave Sales unframed and make the baseline collateral damage rather than a control."
+    },
+    {
+      "id": "view",
+      "tables": [
+        "SalesView"
+      ],
+      "why": "The view-backed table on its own, so its behaviour is observed without taking anything else down with it."
+    },
+    {
+      "id": "mixed",
+      "tables": [
+        "Sales",
+        "SalesView"
+      ],
+      "why": "Both tables in one model, which is what a real model looks like. It exists to measure the refresh STATUS rather than any table outcome: the drill measured that a view-only model fails to frame under both behaviours, so the refresh status is not a function of directLakeBehavior at all -- but a model that also contains a framable table reports Completed while the view-backed table never frames."
+    }
+  ],
+  "knownNonDeterminism": [
+    {
+      "what": "Framing a view-only model under the default behaviour",
+      "observed": "Run 1 reported Failed with ModelRefresh_ShortMessage_ProcessingError and the table still reading Not Framed afterwards. Run 2, from identical code, reported Completed with the table reading View afterwards.",
+      "why": "Most likely the warehouse metadata for a just-created view not being available yet, which surfaces as cannot access the source Delta table rather than as a view-specific message. Deliberately NOT declared as an assertion: an expectation that has given two different answers would make the drill flaky, and a lab that fails half the time teaches nobody anything. It is recorded here instead so the observation is not lost, and so that anyone who sees the other outcome knows it was seen before."
+    }
+  ]
+}

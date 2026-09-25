@@ -1,0 +1,4 @@
+# Drill output. Written per run, never committed: a report in the repository
+# would be read as the current state of a workspace the drill mutates.
+fallback-report.json
+testResults.xml

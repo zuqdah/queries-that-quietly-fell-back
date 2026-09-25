@@ -1,0 +1,50 @@
+name: Drill
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  drill:
+    name: Measure whether the model is actually in Direct Lake mode
+    runs-on: ubuntu-latest
+    # The environment is named in the OIDC subject, so it is not decoration --
+    # the federated credential trusts repo:OWNER@ID/REPO@ID:environment:lab and
+    # nothing else. Removing it stops the login working.
+    environment: lab
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          # The drill runs T-SQL against the warehouse. System.Data.SqlClient does
+          # not exist on PowerShell 7 on Linux, so the SqlServer module is what
+          # makes this work off Windows -- and its Invoke-Sqlcmd is the only
+          # cross-platform path that accepts an Entra access token.
+          Install-Module SqlServer -Force -AllowClobber
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # No tokens are exported here on purpose. The drill asks the Azure CLI for
+      # each one itself, so there is no step that could print a bearer token into
+      # the log, and nothing to keep in sync between this file and the script.
+      - name: Run the drill
+        shell: pwsh
+        run: |
+          ./scripts/Invoke-FallbackDrill.ps1 -WorkspaceId '${{ vars.FABRIC_WORKSPACE_ID }}'
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: fallback-report
+          path: fallback-report.json
+          if-no-files-found: warn
