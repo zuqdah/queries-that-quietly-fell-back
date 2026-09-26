@@ -29,8 +29,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $WorkspaceId,
-    [Parameter(Mandatory)][string] $WarehouseId,
-    [Parameter(Mandatory)][string] $ConnectionId,
     [Parameter()][string] $MatrixPath = (Join-Path -Path $PSScriptRoot -ChildPath '../fallback-matrix.json'),
     [Parameter()][string] $ReportPath = (Join-Path -Path $PSScriptRoot -ChildPath '../fallback-report.json'),
     [Parameter()][switch] $Keep
@@ -48,6 +46,7 @@ Import-Module SqlServer -ErrorAction Stop
 $matrix = Get-FallbackMatrix -Path $MatrixPath
 
 $suffix = -join ((48..57) + (97..122) | Get-Random -Count 6 | ForEach-Object { [char]$_ })
+$warehouseName = "wh_fallback_$suffix"
 
 $FabricApi = 'https://api.fabric.microsoft.com/v1'
 $PowerBiApi = 'https://api.powerbi.com/v1.0/myorg'
@@ -475,68 +474,29 @@ function Invoke-Framing {
 # --------------------------------------------------------------------- the run
 
 $createdModels = [Collections.Generic.List[string]]::new()
+$warehouseId = $null
 $observations = @{}
 $refreshOutcomes = @{}
 
 try {
-    Write-Information '== Resolving the warehouse'
-    $listed = Invoke-Api -Uri "$FabricApi/workspaces/$WorkspaceId/warehouses/$WarehouseId" -Token $fabricToken
-    if (-not $listed.Ok) { throw "Could not read warehouse $WarehouseId. scripts/bootstrap.sh creates it." }
-    $warehouseName = [string]$listed.Body.displayName
+    Write-Information "== Creating warehouse $warehouseName"
+    $warehouse = New-FabricItem -Collection 'warehouses' -Description 'Warehouse creation' `
+        -Body @{ displayName = $warehouseName; description = 'Source for the Direct Lake fallback drill' }
+    if (-not $warehouse.Ok) { throw $warehouse.Detail }
+    $warehouseId = $warehouse.Id
+
+    $listed = Invoke-Api -Uri "$FabricApi/workspaces/$WorkspaceId/warehouses/$warehouseId" -Token $fabricToken
     $server = [string]$listed.Body.properties.connectionString
     if ([string]::IsNullOrWhiteSpace($server)) { throw 'The warehouse reported no connection string.' }
-    Write-Information "   $warehouseName ($WarehouseId)"
+    Write-Information "   id $warehouseId"
     Write-Information "   endpoint $server"
 
-    # The warehouse is persistent, created by bootstrap, because a cloud
-    # connection is bound to one specific server and database and so cannot be
-    # created ahead of a warehouse that does not exist yet. That makes the fixture
-    # state this drill does not own, which is a new risk for this series: every
-    # other lab builds and destroys everything it measures.
-    #
-    # So the fixture is created if absent and then VERIFIED, every run. A
-    # warehouse somebody edited between runs would otherwise change the numbers
-    # silently, and a drill that trusts state it did not create is exactly the
-    # kind of thing this lab is about.
-    Write-Information '== Ensuring the fixture'
-    $tables = Invoke-Sqlcmd -ServerInstance $server -Database $warehouseName -AccessToken $warehouseToken `
-        -Query "SELECT name FROM sys.objects WHERE name IN ('Sales', 'SalesView') AND type IN ('U', 'V')" -ErrorAction Stop
-    $present = @(@($tables) | ForEach-Object { [string]$_.name })
-
-    if ($present.Count -lt 2) {
-        foreach ($statement in Get-WarehouseFixtureSql) {
-            $first = ($statement -split '\s+')[2]
-            if ($present -contains ($first -replace '^dbo\.', '')) { continue }
-            Invoke-Sqlcmd -ServerInstance $server -Database $warehouseName -AccessToken $warehouseToken `
-                -Query $statement -ErrorAction Stop | Out-Null
-            Write-Information "   created $(($statement -replace '\s+', ' ').Substring(0, [Math]::Min(58, ($statement -replace '\s+', ' ').Length)))"
-        }
+    Write-Information '== Building the fixture'
+    foreach ($statement in Get-WarehouseFixtureSql) {
+        Invoke-Sqlcmd -ServerInstance $server -Database $warehouseName -AccessToken $warehouseToken `
+            -Query $statement -ErrorAction Stop | Out-Null
+        Write-Information "   $(($statement -replace '\s+', ' ').Substring(0, [Math]::Min(68, ($statement -replace '\s+', ' ').Length)))"
     }
-    else {
-        Write-Information '   Sales and SalesView already exist'
-    }
-
-    # Both objects must agree, to the penny, before anything is measured. The
-    # assertion about a fallen-back table returning correct results is only
-    # meaningful if the two really do hold the same data to begin with.
-    $integrity = Invoke-Sqlcmd -ServerInstance $server -Database $warehouseName -AccessToken $warehouseToken -ErrorAction Stop `
-        -Query @'
-SELECT
-    (SELECT COUNT(*) FROM dbo.Sales)          AS SalesRows,
-    (SELECT SUM(Amount) FROM dbo.Sales)       AS SalesTotal,
-    (SELECT COUNT(*) FROM dbo.SalesView)      AS ViewRows,
-    (SELECT SUM(Amount) FROM dbo.SalesView)   AS ViewTotal
-'@
-
-    $expectedRows = 4
-    $expectedTotal = [decimal]835.75
-    if ([int]$integrity.SalesRows -ne $expectedRows -or [decimal]$integrity.SalesTotal -ne $expectedTotal) {
-        throw "The fixture is not what this drill expects: Sales has $($integrity.SalesRows) rows totalling $($integrity.SalesTotal), expected $expectedRows totalling $expectedTotal. The warehouse is persistent and something has changed it; recreate it rather than grading against an unknown fixture."
-    }
-    if ([int]$integrity.ViewRows -ne [int]$integrity.SalesRows -or [decimal]$integrity.ViewTotal -ne [decimal]$integrity.SalesTotal) {
-        throw "Sales and SalesView disagree ($($integrity.SalesTotal) vs $($integrity.ViewTotal)). The correctness assertion would be meaningless."
-    }
-    Write-Information "   verified: $($integrity.SalesRows) rows totalling $($integrity.SalesTotal), and the view agrees"
 
     foreach ($pass in $matrix.passes) {
         foreach ($model in $matrix.models) {
@@ -545,35 +505,11 @@ SELECT
             Write-Information "== $($pass.id) / $($model.id): $modelName"
 
             $definition = Get-ModelDefinition -Name $modelName -Behavior $pass.directLakeBehavior `
-                -Tables @($model.tables) -Server $server -DatabaseId $WarehouseId
+                -Tables @($model.tables) -Server $server -DatabaseId $warehouseId
             $created = New-FabricItem -Collection 'semanticModels' -Body $definition -Description 'Semantic model creation'
             if (-not $created.Ok) { throw $created.Detail }
             $createdModels.Add($created.Id)
             $datasetId = $created.Id
-
-            # Without this the model cannot frame at all when the drill runs as a
-            # service principal: it fails with "We cannot access the source Delta
-            # table", which reads like a missing table rather than a missing
-            # identity. Default single sign-on has no interactive user to borrow,
-            # so the model is bound to a connection whose fixed identity is the
-            # workspace identity.
-            #
-            # gatewayObjectId takes the CONNECTION id. Fabric models a cloud
-            # connection as a virtual gateway cluster, which is not written down
-            # anywhere obvious -- Default.DiscoverGateways returns an empty list
-            # for this dataset and the datasource carries no gateway id, so the
-            # documented route looks inapplicable.
-            $bindSplat = @{
-                Method = "Post"
-                Token  = $powerBiToken
-                Uri    = "$PowerBiApi/groups/$WorkspaceId/datasets/$datasetId/Default.BindToGateway"
-                Body   = @{ gatewayObjectId = $ConnectionId }
-            }
-            $bind = Invoke-Api @bindSplat
-            if (-not $bind.Ok) {
-                throw "Could not bind $modelName to connection $ConnectionId (HTTP $($bind.Status)). Every measurement after this would be Unknown, so the drill stops here rather than reporting eleven inconclusive results."
-            }
-            Write-Information "   bound to the fixed-identity connection"
 
             # beforeFraming: the state the API leaves a new model in. No extra
             # setup stages this -- creating the model is what produces it.
@@ -609,14 +545,14 @@ finally {
         foreach ($id in $createdModels) {
             $null = Invoke-Api -Method Delete -Token $fabricToken -Uri "$FabricApi/workspaces/$WorkspaceId/semanticModels/$id"
         }
-        # The warehouse is deliberately left alone: bootstrap owns it, and the
-        # cloud connection is bound to it by id, so deleting it here would break
-        # the connection and every run after this one.
-        Write-Information "   removed $($createdModels.Count) semantic model(s); the warehouse belongs to bootstrap and stays"
+        if ($warehouseId) {
+            $null = Invoke-Api -Method Delete -Token $fabricToken -Uri "$FabricApi/workspaces/$WorkspaceId/warehouses/$warehouseId"
+        }
+        Write-Information "   removed $($createdModels.Count) semantic model(s) and the warehouse"
     }
     else {
         Write-Information ''
-        Write-Information "== Left behind for inspection: $($createdModels.Count) semantic model(s)"
+        Write-Information "== Left behind for inspection: warehouse $warehouseName and $($createdModels.Count) semantic model(s)"
     }
 }
 

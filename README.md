@@ -149,53 +149,65 @@ can be graded at all.
 
 The reasons actually observed are `"Not Framed"` and `"View"`.
 
-## The part that only shows up in CI
+## The check that cannot be automated
 
-Everything above was measured twice: once from a laptop as a signed-in user, and
-once from GitHub Actions as a federated service principal. The first worked. The
-second reported **eleven inconclusive results**, because a Direct Lake semantic
-model owned by a service principal cannot frame at all under the default
-configuration.
+Every other lab in this series runs its drill unattended from GitHub Actions,
+against a federated service principal, so that a reader can trigger it and watch
+it grade itself. This one cannot, and the reason turned out to be the most useful
+thing here.
 
-The error is `We cannot access the source Delta table 'Sales'`, on a warehouse
-the service principal had just created itself, with Admin on the workspace, after
-successfully running `CREATE TABLE`, `INSERT` and `CREATE VIEW` against it
-seconds earlier. Nothing in that message is about identity.
+`EVALUATE TABLETRAITS()` is the only way to see whether a table is really running
+in Direct Lake mode. It is a DAX query, so reaching it from automation means the
+`executeQueries` REST API — and that API's own documentation says:
 
-The cause is single sign-on. By default a Direct Lake model resolves data access
-through the identity of whoever is querying, and a service principal running
-unattended is not an interactive identity to borrow. The documentation says so,
-in one clause of one sentence: service principals are supported, *"but the
-default Direct Lake semantic models on lakehouse/warehouse don't support this
-scenario"*. The fix is to bind the model to a cloud connection with a **fixed
-identity**.
+> To use Service Principals, make sure the admin tenant setting *Allow service
+> principals to use Power BI APIs* is enabled. However, **regardless of the admin
+> tenant setting, Service Principals aren't supported for datasets with RLS or
+> datasets with SSO enabled.**
 
-Three things about that were not in any documentation I could find:
+A Direct Lake on SQL semantic model is single-sign-on by nature: that is how it
+resolves who may read the Delta tables. So the exclusion applies to precisely the
+kind of model this lab exists to inspect.
+
+Measured, not inferred. From a signed-in user the drill reports **11/11 on four
+consecutive runs**. From a service principal with Admin on the workspace, the
+tenant setting enabled, and the model it had created itself, every query returns
+`PowerBINotAuthorizedException` and all eleven outcomes come back `Unknown`.
+
+So the finding is not only that the fallback is silent. It is that **the one
+signal capable of detecting it cannot be put in a pipeline.** A team that wants
+this check has to run it as a person, on a schedule someone remembers, which in
+practice means it does not get run.
+
+### What was tried, and why it is not in this repository
+
+The failure looks like a permissions problem, so it was worth chasing, and the
+chase produced two real findings worth keeping even though the code is gone.
+
+**A service-principal-owned Direct Lake model cannot frame under default SSO
+either.** It fails with `We cannot access the source Delta table 'Sales'`, on a
+warehouse the principal created itself, seconds after successfully running
+`CREATE TABLE` and `INSERT` against it. Nothing in that message is about
+identity. The fix is to bind the model to a cloud connection with a fixed
+identity, and a **workspace identity** works as that identity — which means no
+client secret has to exist anywhere.
 
 **`gatewayObjectId` takes the connection id.** The documented route is
-`Default.BindToGateway`, and for this dataset `Default.DiscoverGateways` returns
-an empty list while the datasource carries no gateway id at all — so the route
-looks inapplicable. Fabric models a cloud connection as a virtual gateway
-cluster, so passing the connection's own id works. `HTTP 200`, and the model
-frames immediately afterwards.
+`Default.BindToGateway`, and for these datasets `Default.DiscoverGateways`
+returns an empty list while the datasource carries no gateway id at all, so the
+documented route looks inapplicable. Fabric models a cloud connection as a
+virtual gateway cluster, so passing the connection's own id works — `HTTP 200`,
+and framing succeeds immediately afterwards. Also worth knowing: workspace Admin
+does not grant *use* of a connection, which carries its own role assignments, and
+a model bound to a connection the caller cannot use fails at framing rather than
+at bind time.
 
-**Workspace Admin is not enough to use a connection.** Connections carry their
-own role assignments. Binding a model to one the orchestrator cannot use fails
-later, at framing, rather than at bind time.
-
-**The fixed identity does not have to be a secret.** A service principal
-credential on the connection would mean a client secret to store and rotate.
-A **workspace identity** is a supported authentication method for these
-connections, so there is no secret anywhere in this design — and the connection
-is created with `skipTestConnection` false, which means Fabric verified the
-identity really can read the warehouse before the drill ever ran.
-
-The cost of all this is that the warehouse became persistent setup: a connection
-is bound to one specific server *and* database, so it cannot be created ahead of
-a warehouse that does not exist yet. The drill therefore creates and destroys
-only the semantic models — which are the thing under test anyway — and verifies
-the fixture on every run, because state this drill does not own is exactly the
-kind of thing it exists to be suspicious of.
+All of that fixed framing and none of it fixed the queries, which is the part
+that matters. So the workspace identity, the connection, the federated
+application and the persistent warehouse it forced have all been removed, and the
+drill owns everything it measures again. Complexity that exists because something
+was attempted is worse than no complexity: the honest artefact is a small script
+and a written-down reason.
 
 ## Cost
 
@@ -217,32 +229,23 @@ the fixture up — it bills at **$0.54 per CU-hour, three times the base rate**.
 
 ```bash
 scripts/bootstrap.sh --workspace lab-directlake-fallback --capacity <trial-capacity-name>
-gh workflow run drill.yml
+pwsh ./scripts/Invoke-FallbackDrill.ps1 -WorkspaceId <the guid it prints>
 ```
 
-The bootstrap creates everything the drill does not own and is re-runnable: a
-workspace identity, the warehouse, a cloud connection bound to it with that
-identity fixed, a federated Entra application, **Admin** on the workspace and
-**User** on the connection, and the repository variables and secrets.
+The bootstrap creates the one thing the drill does not create for itself: a
+workspace on a capacity. It also refuses early for the three things that fail
+confusingly later — a tenant where nobody has ever signed in to Fabric, which
+returns `UserNotLicensed` from every call; a personal workspace, where Direct
+Lake models cannot be created at all; and a workspace with no capacity.
 
-Admin rather than Member is not convenience: the drill creates a warehouse and
-six semantic models and deletes them again, and Member cannot delete items it did
-not create. Without the delete, a second run inherits the first run's state and a
-guard passes for the wrong reason.
+The drill builds and destroys everything it measures: a warehouse, the fixture,
+and all six semantic models. Everything it creates is deleted at the end, because
+a second run must not inherit the first one's state — a guard that passes because
+a table was already framed is not a guard. Pass `-Keep` to leave the models behind
+for inspection.
 
-The workspace is created once, by a human, and reused. The drill only creates
-items *inside* it. That split means the tenant setting *"Service principals can
-create workspaces, connections, and deployment pipelines"* can stay off — there
-is no reason to grant a lab orchestrator that when a workspace role is enough.
-The setting it does need is the separate *"Service principals can call Fabric
-public APIs"*, and `bootstrap.sh` checks for it rather than letting the drill
-discover it as a 401.
-
-Locally, with PowerShell 7 and the Azure CLI:
-
-```bash
-pwsh ./scripts/Invoke-FallbackDrill.ps1 \n  -WorkspaceId <guid> -WarehouseId <guid> -ConnectionId <guid>
-```
+**It runs as you, not as a service principal.** See
+[The check that cannot be automated](#the-check-that-cannot-be-automated).
 
 If the machine has no PowerShell 7 — the one this was written on has 5.1 only —
 [`dev/controller.Dockerfile`](dev/controller.Dockerfile) builds one. Pass the
@@ -299,7 +302,7 @@ code.
 **The drill passed on a laptop and reported eleven inconclusive results in CI.**
 Because a service-principal-owned Direct Lake model cannot frame under default
 single sign-on, which no amount of local testing as a signed-in user would ever
-have shown. See [The part that only shows up in CI](#the-part-that-only-shows-up-in-ci).
+have shown. See [The check that cannot be automated](#the-check-that-cannot-be-automated).
 Worth saying what went right: the drill graded that run `Unknown` everywhere it
 could not measure, never a false pass, and exited non-zero. The tooling was
 correct and the environment was not, which is the outcome the design was for.
