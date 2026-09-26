@@ -2,20 +2,31 @@
 #
 # One-time setup so the drill can run unattended.
 #
-# Creates a federated Entra application, gives it Admin on an existing Fabric
-# workspace, and configures this repository. Re-runnable: everything it creates
-# is looked up first.
+# Creates the persistent half of the lab -- a workspace identity, a warehouse and
+# a cloud connection -- plus a federated Entra application to run the drill, and
+# configures this repository. Re-runnable: everything it creates is looked up
+# first.
 #
-# The workspace is created here, by a human, and reused. The drill creates and
-# destroys only the items inside it -- a warehouse and two semantic models.
-# That is a deliberate split: creating a workspace requires the tenant setting
-# "Service principals can create workspaces, connections, and deployment
-# pipelines", and there is no reason to hand a lab orchestrator that when a
-# workspace role is enough. The setting the drill DOES need,
-# "Service principals can call Fabric public APIs", is separate and is checked
-# below.
+# Why the warehouse lives here and not in the drill
+# -------------------------------------------------
+# A semantic model created by a service principal cannot frame under the default
+# single sign-on configuration. It fails with "We cannot access the source Delta
+# table", which reads like a missing table rather than a missing identity, and
+# the documentation says as much in passing: default Direct Lake semantic models
+# on a lakehouse or warehouse do not support service principals. The fix is to
+# bind each model to a cloud connection with a fixed identity.
 #
-# Needs: az, gh. Not jq -- both tools parse JSON themselves.
+# A connection targets one specific server AND database, so it cannot be created
+# ahead of a warehouse that does not exist yet. That makes the warehouse
+# persistent setup and the semantic models the only thing the drill creates and
+# destroys -- which is the right split anyway, since the models are what is under
+# test.
+#
+# The fixed identity is the WORKSPACE IDENTITY, not a service principal secret.
+# That is deliberate: there is no client secret anywhere in this design, so
+# nothing to store, rotate or leak.
+#
+# Needs: az, gh, node. Not jq -- all three tools parse JSON themselves.
 set -euo pipefail
 
 WORKSPACE=""
@@ -23,6 +34,8 @@ CAPACITY=""
 REPO=""
 ENVIRONMENT="lab"
 APP_NAME="queries-that-quietly-fell-back-orchestrator"
+WAREHOUSE_NAME="wh_fallback"
+CONNECTION_NAME="queries-that-quietly-fell-back-warehouse"
 FABRIC_API="https://api.fabric.microsoft.com/v1"
 
 usage() {
@@ -58,7 +71,9 @@ fi
 say() { printf '\n== %s\n' "$1"; }
 note() { printf '   %s\n' "$1"; }
 
-# Reads a field out of a JSON object on stdin without needing jq.
+# Evaluates a JS expression against a JSON object on stdin. $1 refers to the
+# parsed object as `j`. Prints an empty line rather than throwing, so callers
+# test for emptiness.
 pick() { node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);const v=$1;console.log(v===undefined||v===null?'':v);}catch(e){console.log('');}})"; }
 
 fabric() {
@@ -69,6 +84,35 @@ fabric() {
     -H 'Content-Type: application/json')
   if [ -n "$body" ]; then args+=(--data "$body"); fi
   curl "${args[@]}"
+}
+
+fabric_async() {
+  # Posts and, on a 202, polls the operation to completion. Prints the final
+  # state. A create that is still Running is not a create that worked.
+  local method="$1" path="$2" body="${3:-}"
+  local args=(-sS -D - -o /dev/null -X "$method" "${FABRIC_API}/${path}"
+    -H "Authorization: Bearer ${FABRIC_TOKEN}"
+    -H 'Content-Type: application/json')
+  if [ -n "$body" ]; then args+=(--data "$body"); else args+=(-H 'Content-Length: 0'); fi
+
+  local headers status location
+  headers=$(curl "${args[@]}")
+  status=$(printf '%s' "$headers" | head -1 | awk '{print $2}')
+  if [ "$status" = "200" ] || [ "$status" = "201" ]; then echo "Succeeded"; return 0; fi
+  if [ "$status" != "202" ]; then echo "HTTP ${status}"; return 0; fi
+
+  location=$(printf '%s' "$headers" | grep -i '^location:' | tr -d '\r' | sed 's/^[Ll]ocation: //')
+  local state=""
+  local elapsed=0
+  while [ "$elapsed" -lt 120 ]; do
+    sleep 10
+    elapsed=$((elapsed + 10))
+    state=$(curl -sS -H "Authorization: Bearer ${FABRIC_TOKEN}" "$location" | pick 'j.status')
+    case "$state" in
+      Succeeded|Failed) echo "$state"; return 0 ;;
+    esac
+  done
+  echo "TimedOut(${state})"
 }
 
 # ------------------------------------------------------------------ preflight
@@ -91,7 +135,8 @@ fi
 
 # The one tenant setting the drill cannot work around. Checked rather than
 # assumed, because its name and the name of the workspace-creation setting are
-# easy to confuse -- the title, not the identifier, is what the portal shows.
+# easy to confuse -- and were confused once, costing an afternoon. The title,
+# not the identifier, is what the portal shows.
 say "Checking the tenant allows service principals to call Fabric APIs"
 SP_APIS=$(fabric GET admin/tenantsettings | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const s=(JSON.parse(d).tenantSettings||[]).find(x=>x.settingName==='ServicePrincipalAccessPermissionAPIs');console.log(s?String(s.enabled):'unknown');}catch(e){console.log('unreadable');}})")
 case "$SP_APIS" in
@@ -119,7 +164,87 @@ else
   [ -n "$CAPACITY_ID" ] || { echo "No capacity matching '${CAPACITY}'. A Fabric trial capacity is started from the account manager in the Fabric portal." >&2; exit 1; }
   WORKSPACE_ID=$(fabric POST workspaces "{\"displayName\":\"${WORKSPACE}\",\"capacityId\":\"${CAPACITY_ID}\"}" | pick 'j.id')
   [ -n "$WORKSPACE_ID" ] || { echo "Could not create workspace '${WORKSPACE}'." >&2; exit 1; }
-  note "created ${WORKSPACE_ID} on capacity ${CAPACITY_ID}"
+  note "created ${WORKSPACE_ID}"
+fi
+
+# ---------------------------------------------------- the workspace identity
+
+# This is the fixed identity the connection will use. It exists so that no client
+# secret has to: a service principal credential on the connection would mean a
+# secret in a repository or a vault, and this needs neither.
+say "Provisioning the workspace identity"
+EXISTING_IDENTITY=$(fabric GET "workspaces/${WORKSPACE_ID}" | pick 'j.workspaceIdentity && j.workspaceIdentity.servicePrincipalId')
+if [ -n "$EXISTING_IDENTITY" ]; then
+  note "already has one (${EXISTING_IDENTITY})"
+else
+  STATE=$(fabric_async POST "workspaces/${WORKSPACE_ID}/provisionIdentity")
+  if [ "$STATE" != "Succeeded" ]; then
+    echo "   provisioning the workspace identity ended in: ${STATE}" >&2
+    echo "   A workspace identity needs a Fabric capacity. A trial capacity works; shared does not." >&2
+    exit 1
+  fi
+  EXISTING_IDENTITY=$(fabric GET "workspaces/${WORKSPACE_ID}" | pick 'j.workspaceIdentity && j.workspaceIdentity.servicePrincipalId')
+  note "provisioned (${EXISTING_IDENTITY})"
+fi
+
+# --------------------------------------------------------------- the warehouse
+
+say "Creating the warehouse"
+WAREHOUSE_ID=$(fabric GET "workspaces/${WORKSPACE_ID}/warehouses" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=(JSON.parse(d).value||[]);const m=v.find(w=>w.displayName===process.argv[1]);console.log(m?m.id:'');}catch(e){console.log('');}})" "$WAREHOUSE_NAME")
+
+if [ -n "$WAREHOUSE_ID" ]; then
+  note "reusing ${WAREHOUSE_ID}"
+else
+  STATE=$(fabric_async POST "workspaces/${WORKSPACE_ID}/warehouses" \
+    "{\"displayName\":\"${WAREHOUSE_NAME}\",\"description\":\"Source for the Direct Lake fallback drill\"}")
+  if [ "$STATE" != "Succeeded" ]; then
+    echo "   warehouse creation ended in: ${STATE}" >&2
+    exit 1
+  fi
+  WAREHOUSE_ID=$(fabric GET "workspaces/${WORKSPACE_ID}/warehouses" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=(JSON.parse(d).value||[]);const m=v.find(w=>w.displayName===process.argv[1]);console.log(m?m.id:'');}catch(e){console.log('');}})" "$WAREHOUSE_NAME")
+  [ -n "$WAREHOUSE_ID" ] || { echo "   warehouse reported success but is not listed." >&2; exit 1; }
+  note "created ${WAREHOUSE_ID}"
+fi
+
+SQL_ENDPOINT=$(fabric GET "workspaces/${WORKSPACE_ID}/warehouses/${WAREHOUSE_ID}" | pick 'j.properties && j.properties.connectionString')
+[ -n "$SQL_ENDPOINT" ] || { echo "   the warehouse reported no connection string." >&2; exit 1; }
+note "endpoint ${SQL_ENDPOINT}"
+
+# --------------------------------------------------------------- the connection
+
+# Bound to the warehouse by server AND database, which is why it cannot be
+# created before the warehouse exists. singleSignOnType None keeps the fixed
+# identity in use for framing and for queries; with SSO on, framing would fall
+# back to the caller's identity and the drill would break again under CI.
+say "Creating the cloud connection"
+CONNECTION_ID=$(fabric GET connections | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=(JSON.parse(d).value||[]);const m=v.find(c=>c.displayName===process.argv[1]);console.log(m?m.id:'');}catch(e){console.log('');}})" "$CONNECTION_NAME")
+
+if [ -n "$CONNECTION_ID" ]; then
+  note "reusing ${CONNECTION_ID}"
+else
+  CONNECTION_ID=$(fabric POST connections "{
+    \"connectivityType\": \"ShareableCloud\",
+    \"displayName\": \"${CONNECTION_NAME}\",
+    \"connectionDetails\": {
+      \"type\": \"SQL\",
+      \"creationMethod\": \"SQL\",
+      \"parameters\": [
+        {\"dataType\": \"Text\", \"name\": \"server\", \"value\": \"${SQL_ENDPOINT}\"},
+        {\"dataType\": \"Text\", \"name\": \"database\", \"value\": \"${WAREHOUSE_ID}\"}
+      ]
+    },
+    \"privacyLevel\": \"Organizational\",
+    \"credentialDetails\": {
+      \"singleSignOnType\": \"None\",
+      \"connectionEncryption\": \"NotEncrypted\",
+      \"skipTestConnection\": false,
+      \"credentials\": { \"credentialType\": \"WorkspaceIdentity\" }
+    }
+  }" | pick 'j.id')
+  [ -n "$CONNECTION_ID" ] || { echo "   could not create the connection." >&2; exit 1; }
+  # skipTestConnection was false, so reaching this line means Fabric tested the
+  # connection and the workspace identity really can read the warehouse.
+  note "created ${CONNECTION_ID} (test connection passed)"
 fi
 
 # ----------------------------------------------------------------- the identity
@@ -171,12 +296,12 @@ else
   note "credential set"
 fi
 
-# --------------------------------------------------- the workspace role
+# --------------------------------------------------- roles for the orchestrator
 
-# Admin, not Member. The drill creates a warehouse and semantic models and
-# deletes them again at the end of a run, and Member cannot delete items it did
-# not create. Without the delete, a second run inherits the first run's state
-# and a guard passes for the wrong reason.
+# Admin, not Member. The drill creates six semantic models and deletes them
+# again, and Member cannot delete items it did not create. Without the delete, a
+# second run inherits the first run's state and a guard passes for the wrong
+# reason.
 say "Granting the application Admin on the workspace"
 ASSIGNED=$(fabric GET "workspaces/${WORKSPACE_ID}/roleAssignments" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=(JSON.parse(d).value||[]);const id=process.argv[1];const m=v.find(r=>r.principal&&r.principal.id===id);console.log(m?m.role:'');}catch(e){console.log('');}})" "$SP_OBJECT_ID")
 
@@ -187,10 +312,29 @@ else
     "{\"principal\":{\"id\":\"${SP_OBJECT_ID}\",\"type\":\"ServicePrincipal\"},\"role\":\"Admin\"}")
   CODE=$(echo "$RESULT" | pick 'j.errorCode')
   if [ -n "$CODE" ]; then
-    echo "   could not assign the role: ${CODE} $(echo "$RESULT" | pick 'j.message')" >&2
+    echo "   could not assign the workspace role: ${CODE} $(echo "$RESULT" | pick 'j.message')" >&2
     exit 1
   fi
   note "Admin assigned"
+fi
+
+# Workspace Admin is not enough to USE a connection -- connections carry their
+# own role assignments, and binding a model to one the orchestrator cannot use
+# fails at framing rather than at bind time.
+say "Granting the application use of the connection"
+CONN_ROLE=$(fabric GET "connections/${CONNECTION_ID}/roleAssignments" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=(JSON.parse(d).value||[]);const id=process.argv[1];const m=v.find(r=>r.principal&&r.principal.id===id);console.log(m?m.role:'');}catch(e){console.log('');}})" "$SP_OBJECT_ID")
+
+if [ -n "$CONN_ROLE" ]; then
+  note "already has ${CONN_ROLE}"
+else
+  RESULT=$(fabric POST "connections/${CONNECTION_ID}/roleAssignments" \
+    "{\"principal\":{\"id\":\"${SP_OBJECT_ID}\",\"type\":\"ServicePrincipal\"},\"role\":\"User\"}")
+  CODE=$(echo "$RESULT" | pick 'j.errorCode')
+  if [ -n "$CODE" ]; then
+    echo "   could not grant use of the connection: ${CODE} $(echo "$RESULT" | pick 'j.message')" >&2
+    exit 1
+  fi
+  note "User assigned"
 fi
 
 # ----------------------------------------------------- github configuration
@@ -213,6 +357,8 @@ gh_write() {
 }
 
 gh_write "variable FABRIC_WORKSPACE_ID" gh variable set FABRIC_WORKSPACE_ID --repo "$REPO" --body "$WORKSPACE_ID"
+gh_write "variable FABRIC_WAREHOUSE_ID" gh variable set FABRIC_WAREHOUSE_ID --repo "$REPO" --body "$WAREHOUSE_ID"
+gh_write "variable FABRIC_CONNECTION_ID" gh variable set FABRIC_CONNECTION_ID --repo "$REPO" --body "$CONNECTION_ID"
 # Secrets rather than variables: neither is a credential on its own, but GitHub
 # masks secrets in workflow logs and does not mask variables, and the tenant id
 # identifies the directory these labs run in.
@@ -233,6 +379,8 @@ cat <<EOF
   Tenant id     ${TENANT_ID}
   Subject       ${SUBJECT}
   Workspace     ${WORKSPACE_ID}
+  Warehouse     ${WAREHOUSE_ID}
+  Connection    ${CONNECTION_ID}  (fixed identity: workspace identity)
 
   Entra federated credentials take about three minutes to propagate. Then:
 

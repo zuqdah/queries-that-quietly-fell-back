@@ -149,6 +149,54 @@ can be graded at all.
 
 The reasons actually observed are `"Not Framed"` and `"View"`.
 
+## The part that only shows up in CI
+
+Everything above was measured twice: once from a laptop as a signed-in user, and
+once from GitHub Actions as a federated service principal. The first worked. The
+second reported **eleven inconclusive results**, because a Direct Lake semantic
+model owned by a service principal cannot frame at all under the default
+configuration.
+
+The error is `We cannot access the source Delta table 'Sales'`, on a warehouse
+the service principal had just created itself, with Admin on the workspace, after
+successfully running `CREATE TABLE`, `INSERT` and `CREATE VIEW` against it
+seconds earlier. Nothing in that message is about identity.
+
+The cause is single sign-on. By default a Direct Lake model resolves data access
+through the identity of whoever is querying, and a service principal running
+unattended is not an interactive identity to borrow. The documentation says so,
+in one clause of one sentence: service principals are supported, *"but the
+default Direct Lake semantic models on lakehouse/warehouse don't support this
+scenario"*. The fix is to bind the model to a cloud connection with a **fixed
+identity**.
+
+Three things about that were not in any documentation I could find:
+
+**`gatewayObjectId` takes the connection id.** The documented route is
+`Default.BindToGateway`, and for this dataset `Default.DiscoverGateways` returns
+an empty list while the datasource carries no gateway id at all — so the route
+looks inapplicable. Fabric models a cloud connection as a virtual gateway
+cluster, so passing the connection's own id works. `HTTP 200`, and the model
+frames immediately afterwards.
+
+**Workspace Admin is not enough to use a connection.** Connections carry their
+own role assignments. Binding a model to one the orchestrator cannot use fails
+later, at framing, rather than at bind time.
+
+**The fixed identity does not have to be a secret.** A service principal
+credential on the connection would mean a client secret to store and rotate.
+A **workspace identity** is a supported authentication method for these
+connections, so there is no secret anywhere in this design — and the connection
+is created with `skipTestConnection` false, which means Fabric verified the
+identity really can read the warehouse before the drill ever ran.
+
+The cost of all this is that the warehouse became persistent setup: a connection
+is bound to one specific server *and* database, so it cannot be created ahead of
+a warehouse that does not exist yet. The drill therefore creates and destroys
+only the semantic models — which are the thing under test anyway — and verifies
+the fixture on every run, because state this drill does not own is exactly the
+kind of thing it exists to be suspicious of.
+
 ## Cost
 
 **Nothing.** A Fabric trial capacity, which is `FTL4` and lasts 60 days.
@@ -172,8 +220,10 @@ scripts/bootstrap.sh --workspace lab-directlake-fallback --capacity <trial-capac
 gh workflow run drill.yml
 ```
 
-The bootstrap creates a federated Entra application, gives it **Admin** on the
-workspace, and sets the repository variable and secrets. It is re-runnable.
+The bootstrap creates everything the drill does not own and is re-runnable: a
+workspace identity, the warehouse, a cloud connection bound to it with that
+identity fixed, a federated Entra application, **Admin** on the workspace and
+**User** on the connection, and the repository variables and secrets.
 
 Admin rather than Member is not convenience: the drill creates a warehouse and
 six semantic models and deletes them again, and Member cannot delete items it did
@@ -191,7 +241,7 @@ discover it as a 401.
 Locally, with PowerShell 7 and the Azure CLI:
 
 ```bash
-pwsh ./scripts/Invoke-FallbackDrill.ps1 -WorkspaceId <guid>
+pwsh ./scripts/Invoke-FallbackDrill.ps1 \n  -WorkspaceId <guid> -WarehouseId <guid> -ConnectionId <guid>
 ```
 
 If the machine has no PowerShell 7 — the one this was written on has 5.1 only —
@@ -245,6 +295,26 @@ in this series to hit it. CI scans a snippet with two known violations first,
 which both absorbs the warm-up and proves the analyzer still catches what it
 should — a crashed analyzer reports zero findings, which reads exactly like clean
 code.
+
+**The drill passed on a laptop and reported eleven inconclusive results in CI.**
+Because a service-principal-owned Direct Lake model cannot frame under default
+single sign-on, which no amount of local testing as a signed-in user would ever
+have shown. See [The part that only shows up in CI](#the-part-that-only-shows-up-in-ci).
+Worth saying what went right: the drill graded that run `Unknown` everywhere it
+could not measure, never a false pass, and exited non-zero. The tooling was
+correct and the environment was not, which is the outcome the design was for.
+
+**And the check on that run was wrong in the most embarrassing possible way.**
+The CI drill was reported here as having "exited 0 despite failing" — a red run
+coming back green, which would have been the worst bug in the repository. It was
+not. `gh run view --exit-status` exits 1 correctly and the run's conclusion is
+`failure`. The mistake was `gh run watch ... | tail -12; echo $?`, which reports
+the exit status of `tail`. Three subsequent `grep` checks for stray line
+continuations were wrong too: `'\\$'` matches every line containing a dollar
+sign, so they all "found" problems that did not exist. A check nobody checks is
+the subject of this entire series of labs, and it still took inverting the test —
+searching for the character that *should* be there — to establish the files were
+fine.
 
 ## What this does not do
 

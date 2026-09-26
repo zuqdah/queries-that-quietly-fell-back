@@ -40,7 +40,10 @@ jobs:
       - name: Run the drill
         shell: pwsh
         run: |
-          ./scripts/Invoke-FallbackDrill.ps1 -WorkspaceId '${{ vars.FABRIC_WORKSPACE_ID }}'
+          # One line on purpose. A backslash is not a PowerShell line continuation,
+          # and this step runs in pwsh -- the backtick that would work here is easy
+          # to lose to editing, so there is nothing to lose.
+          ./scripts/Invoke-FallbackDrill.ps1 -WorkspaceId '${{ vars.FABRIC_WORKSPACE_ID }}' -WarehouseId '${{ vars.FABRIC_WAREHOUSE_ID }}' -ConnectionId '${{ vars.FABRIC_CONNECTION_ID }}'
 
       - uses: actions/upload-artifact@v5
         if: always()
