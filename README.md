@@ -41,7 +41,7 @@ A real Fabric warehouse, six semantic models, and expectations declared in
 | Assertions about the signals people check | 5 |
 | Declared in | [`fallback-matrix.json`](fallback-matrix.json), written before the run |
 | Unit tests | 42, no Fabric environment required |
-| Cost | nothing — a Fabric trial capacity |
+| Cost | nothing — a 60-day Fabric trial capacity, which is not a free tier |
 
 The three guards are one framed table (the control), **the same table before the
 model was framed**, and a table over an unmaterialised SQL view. The first two
@@ -50,6 +50,8 @@ as the only difference between them, so the table itself cannot be the
 explanation.
 
 ## The result
+
+From the drill on 2026-09-25, against a real Fabric capacity:
 
 ```
 == automatic / clean
@@ -216,9 +218,22 @@ and a written-down reason.
 Being straight about what that means: Microsoft Fabric has **no free tier**. The
 per-user "Fabric (Free)" licence grants no compute — it only lets you create
 Fabric items in a workspace that is already backed by a capacity. So the options
-are a 60-day trial or an F capacity, and the trial behind this lab expires.
+are a 60-day trial or an F capacity, and the trial behind this lab expires. The
+one these measurements were made on started 25 September 2026 and ends
+**24 November 2026**, and what happens then is worth knowing in advance. Per
+[the trial documentation](https://learn.microsoft.com/en-us/fabric/fundamentals/fabric-trial#when-your-fabric-trial-ends):
+access to the capacity is revoked, the workspace is **reassigned to Pro**, and the
+non-Power BI items in it — which is everything this lab builds — become
+*inactive rather than missing*. They stay in OneLake for **seven days** and can be
+revived by assigning the workspace to an F or P capacity; after that they are gone.
 
-The drill takes the workspace as a parameter for exactly that reason. Anyone
+So an expired trial does not present as a clean failure. It presents as a
+workspace full of items that are listed and will not open, which is a worse
+thing to meet without warning than an error would be. None of it affects what
+was measured: silent fallback is a property of Direct Lake, not of the SKU
+underneath it.
+
+The drill takes the workspace as a parameter because of that expiry. Anyone
 reading this can point it at their own trial, or at an **F2 at $0.36/hour**
 (measured from the Azure retail price API: $0.18 per capacity-unit-hour × 2),
 billed per second with a one-minute minimum and pausable. A full drill run is a
